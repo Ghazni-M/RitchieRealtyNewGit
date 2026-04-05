@@ -1,27 +1,29 @@
-// services/api.ts
+// src/services/api.ts   (or src/lib/api.ts)
 const API_BASE = '/api';
 
 export const api = {
-  async get(endpoint: string) {
+  async get<T = any>(endpoint: string): Promise<T> {
     const url = `${API_BASE}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    
     const res = await fetch(url, {
       method: 'GET',
-      credentials: 'include',           // Sends cookies (JWT token)
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
       },
     });
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(errorText || `HTTP ${res.status}`);
+      const errorText = await res.text().catch(() => '');
+      throw new Error(errorText || `HTTP error! status: ${res.status}`);
     }
 
     return res.json();
   },
 
-  async post(endpoint: string, data: any) {
+  async post<T = any>(endpoint: string, data: any): Promise<T> {
     const url = `${API_BASE}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    
     const res = await fetch(url, {
       method: 'POST',
       credentials: 'include',
@@ -32,15 +34,16 @@ export const api = {
     });
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(errorText || `HTTP ${res.status}`);
+      const errorText = await res.text().catch(() => '');
+      throw new Error(errorText || `HTTP error! status: ${res.status}`);
     }
 
     return res.json();
   },
 
-  async put(endpoint: string, data: any) {
+  async put<T = any>(endpoint: string, data: any): Promise<T> {
     const url = `${API_BASE}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    
     const res = await fetch(url, {
       method: 'PUT',
       credentials: 'include',
@@ -51,29 +54,30 @@ export const api = {
     });
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(errorText || `HTTP ${res.status}`);
+      const errorText = await res.text().catch(() => '');
+      throw new Error(errorText || `HTTP error! status: ${res.status}`);
     }
 
     return res.json();
   },
 
-  async delete(endpoint: string) {
+  async delete<T = any>(endpoint: string): Promise<T> {
     const url = `${API_BASE}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    
     const res = await fetch(url, {
       method: 'DELETE',
       credentials: 'include',
     });
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(errorText || `HTTP ${res.status}`);
+      const errorText = await res.text().catch(() => '');
+      throw new Error(errorText || `HTTP error! status: ${res.status}`);
     }
 
     return res.json();
   },
 
-  async upload(file: File) {
+  async upload(file: File): Promise<{ success: boolean; url: string }> {
     const formData = new FormData();
     formData.append('image', file);
 
@@ -84,8 +88,8 @@ export const api = {
     });
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(errorText || `HTTP ${res.status}`);
+      const errorText = await res.text().catch(() => '');
+      throw new Error(errorText || `Upload failed: ${res.status}`);
     }
 
     return res.json();
