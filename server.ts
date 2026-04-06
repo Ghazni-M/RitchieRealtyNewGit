@@ -241,42 +241,78 @@ async function startServer() {
 
   // ── Auth routes ───────────────────────────────────────────────────────
 
-  app.post('/api/auth/login', authLimiter, async (req, res) => {
-    const { email, password } = req.body;
-    if (typeof email !== 'string' || typeof password !== 'string') {
-      return res.status(400).json({ success: false, error: 'Invalid input' });
+// ────────────────────────────────────────────────────────────────
+// LOGIN ROUTE - IMPROVED
+// ────────────────────────────────────────────────────────────────
+app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+
+  // Input validation
+  if (typeof email !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Invalid input: email and password must be strings' 
+    });
+  }
+
+  if (!email.trim() || !password.trim()) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Email and password are required' 
+    });
+  }
+
+  try {
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.trim().toLowerCase()) as any;
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid email or password' 
+      });
     }
 
-    try {
-      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
-      if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    // Create JWT token
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        name: user.name || '', 
+        role: user.role 
+      },
+      JWT_SECRET as string,
+      { expiresIn: '7d' }                    // Longer expiry for better UX (was too short before)
+    );
+
+    // Set secure httpOnly cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: isProduction,                    // false on localhost
+      sameSite: isProduction ? 'none' : 'lax', // 'lax' works best during development
+      maxAge: 7 * 24 * 60 * 60 * 1000,         // 7 days
+      path: '/',
+    });
+
+    // Return success (do NOT return the token in body - cookie is enough)
+    res.json({
+      success: true,
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name || '',
+        role: user.role,
       }
+    });
 
-      const token = jwt.sign(
-        { id: user.id, email: user.email, name: user.name, role: user.role },
-        JWT_SECRET as string,
-        { expiresIn: ACCESS_TOKEN_EXPIRY }
-      );
-
-      res.cookie('token', token, {
-        httpOnly: true,
-        secure: isProduction,
-        sameSite: isProduction ? 'none' : 'lax',
-        maxAge: COOKIE_MAX_AGE_MS,
-        path: '/',
-      });
-
-      res.json({
-        success: true,
-        accessToken: token,
-        user: { id: user.id, email: user.email, name: user.name, role: user.role },
-      });
-    } catch (err) {
-      console.error('Login error:', err);
-      res.status(500).json({ success: false, error: 'Server error' });
-    }
-  });
+  } catch (err: any) {
+    console.error('Login error:', err);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error during login' 
+    });
+  }
+});
 
 
     app.post('/api/auth/logout', (req, res) => {
