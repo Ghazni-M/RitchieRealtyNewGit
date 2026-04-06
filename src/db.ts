@@ -7,16 +7,29 @@ import bcrypt from 'bcrypt';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const dbPath = path.resolve(__dirname, '../data.db');
+// ───────────────────────────────────────────────────────────────
+// Persistent Database Path (Critical for Render)
+// ───────────────────────────────────────────────────────────────
+const dbPath = process.env.NODE_ENV === 'production'
+  ? '/opt/render/project/src/database/database.db'   // Persistent Disk on Render
+  : path.resolve(__dirname, '../database.db');       // Local development
+
+console.log(`📁 Using SQLite database at: ${dbPath}`);
+
+// Ensure the directory exists
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+  console.log(`📁 Created database directory: ${dbDir}`);
+}
 
 const db = new Database(dbPath, {
   verbose: process.env.NODE_ENV === 'development' ? console.log : undefined,
 });
 
 // ───────────────────────────────────────────────────────────────
-// PRAGMAS (performance + safety)
+// PRAGMAS (Performance + Safety)
 // ───────────────────────────────────────────────────────────────
-
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 db.pragma('foreign_keys = ON');
@@ -25,14 +38,13 @@ db.pragma('busy_timeout = 5000');
 // ───────────────────────────────────────────────────────────────
 // SCHEMA
 // ───────────────────────────────────────────────────────────────
-
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL COLLATE NOCASE,
   password TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('owner', 'agent', 'user')) DEFAULT 'agent',
+  role TEXT NOT NULL CHECK(role IN ('owner', 'agent')) DEFAULT 'agent',
   reset_token TEXT,
   reset_token_expiry INTEGER,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -96,8 +108,7 @@ CREATE TABLE IF NOT EXISTS subscribers (
   email TEXT UNIQUE NOT NULL,
   source TEXT DEFAULT 'blog_post',
   subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  confirmed BOOLEAN DEFAULT FALSE,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  confirmed BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS favorites (
@@ -110,77 +121,65 @@ CREATE TABLE IF NOT EXISTS favorites (
   FOREIGN KEY (property_id) REFERENCES properties(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_properties_status   ON properties(status);
+CREATE INDEX IF NOT EXISTS idx_properties_status ON properties(status);
 CREATE INDEX IF NOT EXISTS idx_properties_featured ON properties(featured);
 CREATE INDEX IF NOT EXISTS idx_properties_agent_id ON properties(agent_id);
-CREATE INDEX IF NOT EXISTS idx_posts_slug          ON posts(slug);
+CREATE INDEX IF NOT EXISTS idx_posts_slug ON posts(slug);
 CREATE INDEX IF NOT EXISTS idx_inquiries_created_at ON inquiries(created_at);
 `);
 
 // ───────────────────────────────────────────────────────────────
-// TRIGGERS (safe update timestamps)
+// TRIGGERS (auto update timestamps)
 // ───────────────────────────────────────────────────────────────
-
 db.exec(`
 CREATE TRIGGER IF NOT EXISTS trg_properties_updated
 AFTER UPDATE ON properties
 FOR EACH ROW
 BEGIN
-  UPDATE properties
-  SET updated_at = CURRENT_TIMESTAMP
-  WHERE id = NEW.id;
+  UPDATE properties SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_posts_updated
 AFTER UPDATE ON posts
 FOR EACH ROW
 BEGIN
-  UPDATE posts
-  SET updated_at = CURRENT_TIMESTAMP
-  WHERE id = NEW.id;
+  UPDATE posts SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 `);
 
 // ───────────────────────────────────────────────────────────────
-// SAFE MIGRATION HELPER
+// MIGRATION HELPER
 // ───────────────────────────────────────────────────────────────
-
 function addColumnIfNotExists(table: string, column: string, definition: string) {
   try {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
-    const exists = columns.some(c => c.name === column);
+    const exists = columns.some((c: any) => c.name === column);
 
     if (!exists) {
       db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      console.log(`✅ Added column ${column} to ${table}`);
     }
   } catch (err) {
     console.warn(`Migration skipped for ${table}.${column}`);
   }
 }
 
-// ───────────────────────────────────────────────────────────────
-// MIGRATIONS
-// ───────────────────────────────────────────────────────────────
-
+// Run migrations
 addColumnIfNotExists('users', 'reset_token', 'TEXT');
 addColumnIfNotExists('users', 'reset_token_expiry', 'INTEGER');
 
 // ───────────────────────────────────────────────────────────────
-// SEEDING (idempotent + safe)
+// SAFE SEEDING (only runs if tables are empty)
 // ───────────────────────────────────────────────────────────────
+const seedTables = ['users', 'properties', 'posts'] as const;
 
-const tablesToSeed = ['users', 'properties', 'posts'] as const;
+for (const table of seedTables) {
+  const count = (db.prepare(`SELECT COUNT(*) as count FROM ${table}`).get() as any).count;
 
-for (const table of tablesToSeed) {
-  const count = db.prepare(`SELECT COUNT(*) as count FROM ${table}`).get() as {
-    count: number;
-  };
-
-  if (count.count > 0) continue;
+  if (count > 0) continue;
 
   console.log(`🌱 Seeding ${table}...`);
 
-  // USERS
   if (table === 'users') {
     const hash = (p: string) => bcrypt.hashSync(p, 12);
 
@@ -195,15 +194,9 @@ for (const table of tablesToSeed) {
     `).run('Janet Stanley', 'janet@ritchierealty.com', hash('janet123'), 'agent');
   }
 
-  // PROPERTIES
   if (table === 'properties') {
     db.prepare(`
-      INSERT INTO properties (
-        title, price, address, city, state, zip,
-        beds, baths, sqft, type, status, featured,
-        imageUrl, images, description, features,
-        acreage, zoning, agent_id
-      )
+      INSERT INTO properties (title, price, address, city, state, zip, beds, baths, sqft, type, status, featured, imageUrl, images, description, features, acreage, zoning, agent_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       'Modern Family Estate',
@@ -212,31 +205,15 @@ for (const table of tablesToSeed) {
       'Pennsboro',
       'WV',
       '26415',
-      4,
-      3,
-      2800,
-      'Residential',
-      'Available',
-      1,
+      4, 3, 2800, 'Residential', 'Available', 1,
       'https://images.unsplash.com/photo-1564013799919-ab600027ffc6',
-      JSON.stringify([
-        'https://images.unsplash.com/photo-1564013799919-ab600027ffc6',
-        'https://images.unsplash.com/photo-1512917774080-9991f1c4c750',
-      ]),
-      'A beautiful modern family estate with spacious rooms and a large backyard.',
-      JSON.stringify([
-        'Hardwood Flooring',
-        'Updated Kitchen',
-        'Central Heating & Cooling',
-        'Spacious Backyard',
-      ]),
-      0.5,
-      'Residential',
-      2
+      JSON.stringify(['https://images.unsplash.com/photo-1564013799919-ab600027ffc6']),
+      'A beautiful modern family estate...',
+      JSON.stringify(['Hardwood Flooring', 'Updated Kitchen']),
+      0.5, 'Residential', 2
     );
   }
 
-  // POSTS
   if (table === 'posts') {
     db.prepare(`
       INSERT INTO posts (title, slug, excerpt, content, imageUrl, author_id)
@@ -244,14 +221,14 @@ for (const table of tablesToSeed) {
     `).run(
       'Real Estate Investment Tips for Beginners',
       'real-estate-investment-tips-beginners',
-      'New to real estate investing? Learn essential tips...',
-      'Full article content here...',
+      'New to real estate? Learn essential tips...',
+      '<p>Full article content here...</p>',
       'https://images.unsplash.com/photo-1560518883-ce09059eeffa',
       1
     );
   }
 }
 
-console.log('✅ Database initialized successfully');
+console.log('✅ Database initialized successfully with persistent storage support');
 
 export default db;
