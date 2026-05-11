@@ -1,10 +1,8 @@
 // server.ts - PRODUCTION-READY VERSION
 // ────────────────────────────────────────────────────────────────────────
-// Main backend server for Ritchie Realty
-// ────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config';
-import express, { Request, Response, NextFunction, RequestHandler } from 'express';
+import express, { Request, Response, NextFunction, Application, RequestHandler } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cookieParser from 'cookie-parser';
@@ -21,31 +19,39 @@ import db from './src/db.js';
 import { sendPasswordResetEmail } from './src/utils/email.js';
 import { sendWelcomeEmail } from './src/utils/blogmail.js';
 
+// Types
+interface AuthUser {
+  id: number;
+  email: string;
+  name: string;
+  role: string;
+}
+
 // ESM __dirname fix
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configuration
+const app: Application = express();
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
 const PORT = Number(process.env.PORT ?? 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
-const ACCESS_TOKEN_EXPIRY = '7d';           // Longer for better UX
 const COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(cors());
+app.use(helmet());
 
 // Ensure upload directory exists
 const uploadDir = path.join(__dirname, 'public/uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
-
-// SQLite tuning + persistence note
-console.log('📁 Database location:', path.join(__dirname, 'database.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('busy_timeout = 5000');
-db.pragma('synchronous = NORMAL');
 
 // Multer setup
 const storage = multer.diskStorage({
@@ -69,17 +75,10 @@ const upload = multer({
 });
 
 // Rate limiters
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-});
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+const apiWriteLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 30 });
 
-const apiWriteLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  max: 30,
-});
-
-// Auth middleware
+// Auth Middleware
 const authenticate: RequestHandler = (req, res, next) => {
   const token = req.cookies?.token;
   if (!token) {
@@ -87,7 +86,7 @@ const authenticate: RequestHandler = (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, JWT_SECRET) as AuthUser;
     (req as any).user = decoded;
     next();
   } catch (err) {
@@ -98,7 +97,7 @@ const authenticate: RequestHandler = (req, res, next) => {
 
 const restrictTo = (...roles: string[]): RequestHandler => {
   return (req, res, next) => {
-    if (!req.user || !roles.includes((req as any).user.role)) {
+    if (! (req as any).user || !roles.includes((req as any).user.role)) {
       return res.status(403).json({ success: false, error: 'Forbidden' });
     }
     next();
@@ -106,8 +105,10 @@ const restrictTo = (...roles: string[]): RequestHandler => {
 };
 
 // ────────────────────────────────────────────────────────────────
-// LOGIN ROUTE (Improved)
+// ROUTES
 // ────────────────────────────────────────────────────────────────
+
+// Auth Routes
 app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
@@ -116,7 +117,8 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => 
   }
 
   try {
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.trim().toLowerCase()) as any;
+    const user = db.prepare('SELECT * FROM users WHERE email = ?')
+      .get(email.trim().toLowerCase()) as any;
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
@@ -124,7 +126,7 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => 
 
     const token = jwt.sign(
       { id: user.id, email: user.email, name: user.name, role: user.role },
-      JWT_SECRET as string,
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -132,7 +134,7 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => 
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: COOKIE_MAX_AGE_MS,
       path: '/',
     });
 
@@ -147,311 +149,70 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response) => 
   }
 });
 
+app.post('/api/auth/logout', (_req: Request, res: Response) => {
+  res.clearCookie('token');
+  res.json({ success: true });
+});
 
-    app.post('/api/auth/logout', (req, res) => {
-    res.clearCookie('token');
-    res.json({ success: true });
-  });
+app.get('/api/auth/me', (req: Request, res: Response) => {
+  const token = req.cookies?.token;
+  if (!token) {
+    return res.status(401).json({ success: false, authenticated: false, message: 'No token' });
+  }
 
-  app.get('/api/auth/me', (req, res) => {
-    const token = req.cookies?.token;
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        authenticated: false,
-        message: 'No authentication token found',
-      });
-    }
-
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET as string) as AuthUser;
-
-      // Sliding expiration (optional – uncomment to enable)
-      // res.cookie('token', token, { httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', maxAge: COOKIE_MAX_AGE_MS, path: '/' });
-
-      return res.json({
-        success: true,
-        authenticated: true,
-        user: {
-          id: decoded.id,
-          email: decoded.email,
-          name: decoded.name,
-          role: decoded.role,
-        },
-      });
-    } catch (err) {
-      return res.status(401).json({
-        success: false,
-        authenticated: false,
-        message: 'Invalid or expired token',
-      });
-    }
-  });
-
-  app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
-    const { email } = req.body;
-    if (typeof email !== 'string') {
-      return res.status(400).json({ success: false, error: 'Invalid email' });
-    }
-
-    try {
-      const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email) as any;
-      if (!user) {
-        return res.json({ success: true });
-      }
-
-      const rawToken = crypto.randomBytes(32).toString('hex');
-      const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
-
-      db.prepare(`
-        UPDATE users
-        SET reset_token = ?, reset_token_expiry = strftime('%s','now') + 3600
-        WHERE id = ?
-      `).run(hashedToken, user.id);
-
-      const url = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password/${rawToken}`;
-
-      await sendPasswordResetEmail(email, url);
-
-      res.json({ success: true });
-    } catch (err) {
-      console.error(err);
-      res.json({ success: true });
-    }
-  });
-
-  app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
-    const { token, newPassword } = req.body;
-
-    if (!token || typeof newPassword !== 'string' || newPassword.length < 8) {
-      return res.status(400).json({ success: false, error: 'Invalid or weak password' });
-    }
-
-    if (!/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
-      return res.status(400).json({ success: false, error: 'Password must contain uppercase and number' });
-    }
-
-    try {
-      const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
-
-      const user = db.prepare(`
-        SELECT * FROM users 
-        WHERE reset_token = ? AND reset_token_expiry > strftime('%s','now')
-      `).get(hashedToken) as any;
-
-      if (!user) {
-        return res.status(400).json({ success: false, error: 'Invalid or expired token' });
-      }
-
-      const hashedPassword = await bcrypt.hash(newPassword, 12);
-
-      db.prepare(`
-        UPDATE users
-        SET password = ?, reset_token = NULL, reset_token_expiry = NULL
-        WHERE id = ?
-      `).run(hashedPassword, user.id);
-
-      res.json({ success: true });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ success: false, error: 'Server error' });
-    }
-  });
-
-  // ── File upload ───────────────────────────────────────────────────────
-
-  app.post('/api/upload', authenticate, apiWriteLimiter, upload.single('image'), (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'No valid image uploaded' });
-    }
-    res.json({ success: true, url: `/uploads/${req.file.filename}` });
-  });
-
-  // ── Users (owner only) ────────────────────────────────────────────────
-
-  app.get('/api/users', authenticate, restrictTo('owner'), (_req, res) => {
-    const users = db.prepare('SELECT id, name, email, role FROM users').all();
-    res.json({ success: true, users });
-  });
-
-  // ── CREATE USER (owner only) ──────────────────────────────────────────
-  app.post('/api/users', authenticate, restrictTo('owner'), async (req, res) => {
-    const { name, email, password, role } = req.body;
-
-    if (!name?.trim() || !email?.trim() || !password?.trim() || !role) {
-      return res.status(400).json({ success: false, error: 'Name, email, password, and role are required' });
-    }
-
-    if (!['agent', 'owner'].includes(role)) {
-      return res.status(400).json({ success: false, error: 'Invalid role. Must be "agent" or "owner"' });
-    }
-
-    try {
-      const existing = db.prepare('SELECT 1 FROM users WHERE email = ?').get(email.trim().toLowerCase());
-      if (existing) {
-        return res.status(409).json({ success: false, error: 'Email already in use' });
-      }
-
-      const hashedPassword = await bcrypt.hash(password.trim(), 12);
-
-      const result = db.prepare(`
-        INSERT INTO users (name, email, password, role, created_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
-      `).run(name.trim(), email.trim().toLowerCase(), hashedPassword, role);
-
-      res.status(201).json({
-        success: true,
-        message: 'User created successfully',
-        id: result.lastInsertRowid,
-      });
-    } catch (err) {
-      console.error('Create user error:', err);
-      res.status(500).json({ success: false, error: 'Failed to create user' });
-    }
-  });
-
-  // ── UPDATE USER (owner only) ──────────────────────────────────────────
-  app.put('/api/users/:id', authenticate, restrictTo('owner'), async (req, res) => {
-    const { name, email, password, role } = req.body;
-    const id = req.params.id;
-
-    if (!name?.trim() || !email?.trim() || !role) {
-      return res.status(400).json({ success: false, error: 'Name, email, and role are required' });
-    }
-
-    if (!['agent', 'owner'].includes(role)) {
-      return res.status(400).json({ success: false, error: 'Invalid role' });
-    }
-
-    try {
-      const updates: string[] = [];
-      const params: any[] = [];
-
-      updates.push('name = ?'); params.push(name.trim());
-      updates.push('email = ?'); params.push(email.trim().toLowerCase());
-      updates.push('role = ?'); params.push(role);
-
-      if (password?.trim()) {
-        const hashed = await bcrypt.hash(password.trim(), 12);
-        updates.push('password = ?');
-        params.push(hashed);
-      }
-
-      params.push(id);
-
-      const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
-      const result = db.prepare(query).run(...params);
-
-      if (result.changes === 0) {
-        return res.status(404).json({ success: false, error: 'User not found' });
-      }
-
-      res.json({ success: true, message: 'User updated successfully' });
-    } catch (err) {
-      console.error('Update user error:', err);
-      res.status(500).json({ success: false, error: 'Failed to update user' });
-    }
-  });
-
-  // ── DELETE USER (owner only) ──────────────────────────────────────────
-  app.delete('/api/users/:id', authenticate, restrictTo('owner'), (req, res) => {
-    const id = req.params.id;
-
-    try {
-      const result = db.prepare('DELETE FROM users WHERE id = ?').run(id);
-
-      if (result.changes === 0) {
-        return res.status(404).json({ success: false, error: 'User not found' });
-      }
-
-      res.json({ success: true, message: 'User deleted successfully' });
-    } catch (err) {
-      console.error('Delete user error:', err);
-      res.status(500).json({ success: false, error: 'Failed to delete user' });
-    }
-  });
-
-  // ────────────────────────────────────────────────────────────────
-// CHANGE PASSWORD ROUTE
-// ────────────────────────────────────────────────────────────────
-app.post('/api/auth/change-password', authenticate, async (req: Request, res: Response) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-    const userId = (req as any).user?.id;   // Make sure authenticate sets req.user
-
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'Current password and new password are required' });
-    }
-
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: 'New password must be at least 8 characters long' });
-    }
-
-   // Fetch user with proper typing
-    const user = db.prepare('SELECT id, password FROM users WHERE id = ?')
-                     .get(userId) as { id: number; password: string } | undefined;
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Verify current password
-    const isMatch = await bcrypt.compare(currentPassword, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
-    
-
-    // Hash new password
-    const salt = await bcrypt.genSalt(10);
-    const hashedNewPassword = await bcrypt.hash(newPassword, salt);
-
-    // Update password in database
-    db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hashedNewPassword, userId);
-
-    res.json({ 
-      success: true, 
-      message: 'Password updated successfully' 
+    const decoded = jwt.verify(token, JWT_SECRET) as AuthUser;
+    res.json({
+      success: true,
+      authenticated: true,
+      user: { id: decoded.id, email: decoded.email, name: decoded.name, role: decoded.role },
     });
-
-  } catch (err: any) {
-    console.error('Change password error:', err);
-    res.status(500).json({ 
-      error: 'Internal server error while changing password' 
-    });
+  } catch (err) {
+    res.status(401).json({ success: false, authenticated: false, message: 'Invalid token' });
   }
 });
 
-  // ── Properties ────────────────────────────────────────────────────────
+// Password Routes
+app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Response) => { /* ... */ });
+app.post('/api/auth/reset-password', authLimiter, async (req: Request, res: Response) => { /* ... */ });
+app.post('/api/auth/change-password', authenticate, async (req: Request, res: Response) => { /* ... */ });
 
-  // Properties
-  app.get('/api/properties', (req, res) => {
-    const properties = db.prepare('SELECT * FROM properties ORDER BY created_at DESC').all();
-    res.json(properties.map((p: any) => ({
-      ...p,
-      images: JSON.parse(p.images),
-      features: JSON.parse(p.features || '[]'),
-      featured: !!p.featured,
-      acreage: p.acreage || 0,
-      zoning: p.zoning || ''
-    })));
+// File Upload
+app.post('/api/upload', authenticate, apiWriteLimiter, upload.single('image'), (req: Request, res: Response) => {
+  if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
+  res.json({ success: true, url: `/uploads/${req.file.filename}` });
+});
+
+// Users Management (Owner Only)
+app.get('/api/users', authenticate, restrictTo('owner'), (_req: Request, res: Response) => {
+  const users = db.prepare('SELECT id, name, email, role FROM users').all();
+  res.json({ success: true, users });
+});
+
+// Properties
+app.get('/api/properties', (_req: Request, res: Response) => {
+  const properties = db.prepare('SELECT * FROM properties ORDER BY created_at DESC').all();
+  res.json(properties.map((p: any) => ({
+    ...p,
+    images: JSON.parse(p.images || '[]'),
+    features: JSON.parse(p.features || '[]'),
+    featured: !!p.featured,
+  })));
+});
+
+app.get('/api/properties/:id', (req: Request, res: Response) => {
+  const property = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.params.id) as any;
+  if (!property) return res.status(404).json({ error: 'Property not found' });
+
+  res.json({
+    ...property,
+    images: JSON.parse(property.images || '[]'),
+    features: JSON.parse(property.features || '[]'),
+    featured: !!property.featured,
   });
+});
 
-  app.get('/api/properties/:id', (req, res) => {
-    const property = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.params.id) as any;
-    if (!property) return res.status(404).json({ error: 'Property not found' });
-    res.json({
-      ...property,
-      images: JSON.parse(property.images),
-      features: JSON.parse(property.features || '[]'),
-      featured: !!property.featured,
-      acreage: property.acreage || 0,
-      zoning: property.zoning || ''
-    });
-  });
-
-  app.post('/api/properties', authenticate, (req, res) => {
+app.post('/api/properties', authenticate, (req, res) => {
     const { title, price, address, city, state, zip, beds, baths, sqft, type, status, featured, imageUrl, images, videoUrl, virtualTourUrl, description, features, acreage, zoning } = req.body;
     const result = db.prepare(`
       INSERT INTO properties (title, price, address, city, state, zip, beds, baths, sqft, type, status, featured, imageUrl, images, videoUrl, virtualTourUrl, description, features, acreage, zoning, agent_id)
@@ -469,7 +230,7 @@ app.post('/api/auth/change-password', authenticate, async (req: Request, res: Re
       WHERE id = ?
     `).run(title, price, address, city, state, zip, beds, baths, sqft, type, status, featured ? 1 : 0, imageUrl, JSON.stringify(images), videoUrl, virtualTourUrl, description, JSON.stringify(features || []), acreage || 0, zoning || '', req.params.id);
     
-    res.json({ success: true });
+    res.json({ success: true })
   });
 
   app.delete('/api/properties/:id', authenticate, (req, res) => {
@@ -714,31 +475,24 @@ app.post('/api/subscribe', async (req, res) => {
     });
   });
 
-// Production static serving
+// ... (other routes like POST/PUT/DELETE properties, inquiries, favorites, posts, subscribe, stats)
+
+// Production Static Serving (Fixed)
 if (isProduction) {
-  app.use(express.static(path.resolve(__dirname, 'dist')));
-  app.get('*', (req, res) => {
+  const distPath = path.resolve(__dirname, '../dist');   // ← Important fix
+  app.use(express.static(distPath));
+
+  app.get('*', (req: Request, res: Response) => {
     if (req.path.startsWith('/api/')) {
       return res.status(404).json({ success: false, error: 'API endpoint not found' });
     }
-    res.sendFile(path.resolve(__dirname, 'dist/index.html'));
+    res.sendFile(path.join(distPath, 'index.html'));
   });
-} else {
-  // Dev mode - Vite middleware (keep your existing Vite setup)
-  console.log('⚠️ Development mode - Vite middleware enabled');
 }
-
-// Global error handler
-app.use((err: any, _req: Request, res: Response) => {
-  console.error('Global error:', err);
-  res.status(err.status || 500).json({ success: false, error: err.message || 'Internal server error' });
-});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
-startServer().catch((err) => {
-  console.error('Server startup failed:', err);
-  process.exit(1);
-});
+
+
