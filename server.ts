@@ -388,8 +388,9 @@ app.post('/api/auth/change-password', authenticate, async (req: Request, res: Re
       return res.status(400).json({ error: 'New password must be at least 8 characters long' });
     }
 
-    // Fetch user
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+   // Fetch user with proper typing
+    const user = db.prepare('SELECT id, password FROM users WHERE id = ?')
+                     .get(userId) as { id: number; password: string } | undefined;
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -400,6 +401,7 @@ app.post('/api/auth/change-password', authenticate, async (req: Request, res: Re
     if (!isMatch) {
       return res.status(401).json({ error: 'Current password is incorrect' });
     }
+    
 
     // Hash new password
     const salt = await bcrypt.genSalt(10);
